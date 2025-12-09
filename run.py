@@ -73,6 +73,107 @@ def build_model_from_config(cfg, model_name, use_vllm=False):
     return model
 
 
+def get_decoding_kwargs(decoding='greedy', num_beams=5, top_p=0.9, temperature=0.7):
+    """Get generation kwargs based on decoding strategy.
+
+    Args:
+        decoding: 'greedy', 'beam', or 'nucleus'
+        num_beams: Number of beams for beam search
+        top_p: Top-p value for nucleus sampling
+        temperature: Temperature for nucleus sampling
+
+    Returns:
+        dict: kwargs for model.generate()
+    """
+    if decoding == 'greedy':
+        return dict(
+            do_sample=False,
+            temperature=0,
+            top_p=None,
+            num_beams=1,
+        )
+    elif decoding == 'beam':
+        return dict(
+            do_sample=False,
+            temperature=0,
+            top_p=None,
+            num_beams=num_beams,
+        )
+    elif decoding == 'nucleus':
+        return dict(
+            do_sample=True,
+            temperature=temperature,
+            top_p=top_p,
+            num_beams=1,
+        )
+    else:
+        raise ValueError(f"Unknown decoding strategy: {decoding}")
+
+
+def build_model_with_method(model_name, method=None, decoding='greedy',
+                            num_beams=5, top_p=0.9, temperature=0.7, use_vllm=False):
+    """Build model with hallucination mitigation method and/or decoding strategy.
+
+    Args:
+        model_name: Name of the model in supported_VLM
+        method: Attention-based method ('pai', 'opera', 'allpath') or None
+        decoding: Decoding strategy ('greedy', 'beam', 'nucleus')
+        num_beams: Number of beams for beam search
+        top_p: Top-p value for nucleus sampling
+        temperature: Temperature for nucleus sampling
+        use_vllm: Whether to use vLLM
+    """
+    import vlmeval.vlm
+    ws_bak = os.environ.pop('WORLD_SIZE', None)
+
+    # Get decoding kwargs
+    decoding_kwargs = get_decoding_kwargs(decoding, num_beams, top_p, temperature)
+
+    if method is not None and model_name in supported_VLM:
+        base_model = supported_VLM[model_name]
+
+        # Extract model_path from partial function
+        model_path = None
+        if hasattr(base_model, 'keywords'):
+            model_path = base_model.keywords.get('model_path', None)
+
+        # Check if this is a LLaVA model that supports hallucination mitigation
+        if model_path is not None or 'llava' in model_name.lower():
+            if model_path is None:
+                # Default model paths for common LLaVA models
+                llava_model_map = {
+                    'llava_v1.5_7b': 'liuhaotian/llava-v1.5-7b',
+                    'llava_v1.5_13b': 'liuhaotian/llava-v1.5-13b',
+                    'llava_v1_7b': 'liuhaotian/llava-v1-7b',
+                }
+                model_path = llava_model_map.get(model_name, f'liuhaotian/{model_name}')
+
+            model = vlmeval.vlm.LLaVA_Hallucination(
+                model_path=model_path,
+                decoding_method=method,
+                **decoding_kwargs,
+            )
+            if ws_bak:
+                os.environ['WORLD_SIZE'] = ws_bak
+            return model
+
+    # Build model with decoding kwargs (no attention-based method)
+    if model_name not in supported_VLM:
+        raise ValueError(f"Model {model_name} not found in supported_VLM")
+
+    base_model = supported_VLM[model_name]
+    if hasattr(base_model, 'keywords'):
+        # Merge decoding kwargs with existing keywords
+        merged_kwargs = {**base_model.keywords, **decoding_kwargs}
+        model = base_model.func(**merged_kwargs)
+    else:
+        model = base_model(**decoding_kwargs)
+
+    if ws_bak:
+        os.environ['WORLD_SIZE'] = ws_bak
+    return model
+
+
 def build_dataset_from_config(cfg, dataset_name):
     import vlmeval.dataset
     import inspect
@@ -195,6 +296,25 @@ You can launch the evaluation by setting either --data and --model or --config.
     parser.add_argument(
         '--use-vllm', action='store_true', help='use vllm to generate, the flag is only supported in Llama4 for now')
     parser.add_argument('--use-verifier', action='store_true', help='use verifier to evaluate')
+    # Hallucination mitigation method (attention-based)
+    parser.add_argument(
+        '--method', type=str, default=None,
+        choices=['baseline', 'pai', 'opera', 'allpath'],
+        help='Attention-based decoding method for hallucination mitigation (pai, opera, allpath)')
+    # Standard decoding strategy
+    parser.add_argument(
+        '--decoding', type=str, default='greedy',
+        choices=['greedy', 'beam', 'nucleus'],
+        help='Decoding strategy: greedy (default), beam (beam search), nucleus (top-p sampling)')
+    parser.add_argument(
+        '--num-beams', type=int, default=5,
+        help='Number of beams for beam search (default: 5, only used when --decoding=beam)')
+    parser.add_argument(
+        '--top-p', type=float, default=0.9,
+        help='Top-p value for nucleus sampling (default: 0.9, only used when --decoding=nucleus)')
+    parser.add_argument(
+        '--temperature', type=float, default=0.7,
+        help='Temperature for nucleus sampling (default: 0.7, only used when --decoding=nucleus)')
 
     args = parser.parse_args()
     return args
@@ -252,11 +372,18 @@ def main():
         date, commit_id = timestr('day'), githash(digits=8)
         eval_id = f"T{date}_G{commit_id}"
 
-        pred_root = osp.join(args.work_dir, model_name, eval_id)
-        pred_root_meta = osp.join(args.work_dir, model_name)
+        # Build output model name based on method and decoding strategy
+        output_model_name = model_name
+        if args.method is not None:
+            output_model_name = f'{model_name}_{args.method}'
+        if args.decoding != 'greedy':
+            output_model_name = f'{output_model_name}_{args.decoding}'
+
+        pred_root = osp.join(args.work_dir, output_model_name, eval_id)
+        pred_root_meta = osp.join(args.work_dir, output_model_name)
         os.makedirs(pred_root_meta, exist_ok=True)
 
-        prev_pred_roots = ls(osp.join(args.work_dir, model_name), mode='dir')
+        prev_pred_roots = ls(osp.join(args.work_dir, output_model_name), mode='dir')
         if len(prev_pred_roots) and args.reuse:
             prev_pred_roots.sort()
 
@@ -265,6 +392,17 @@ def main():
 
         if use_config:
             model = build_model_from_config(cfg['model'], model_name, args.use_vllm)
+        elif args.method is not None or args.decoding != 'greedy':
+            # Build model with hallucination mitigation method and/or custom decoding
+            model = build_model_with_method(
+                model_name,
+                method=args.method,
+                decoding=args.decoding,
+                num_beams=args.num_beams,
+                top_p=args.top_p,
+                temperature=args.temperature,
+                use_vllm=args.use_vllm
+            )
 
         for _, dataset_name in enumerate(args.data):
             if WORLD_SIZE > 1:
@@ -272,7 +410,7 @@ def main():
 
             try:
                 pred_format = get_pred_file_format()
-                result_file_base = f'{model_name}_{dataset_name}.{pred_format}'
+                result_file_base = f'{output_model_name}_{dataset_name}.{pred_format}'
 
                 if use_config:
                     if WORLD_SIZE > 1:
@@ -320,7 +458,7 @@ def main():
                         model = infer_data_job_video(
                             model,
                             work_dir=pred_root,
-                            model_name=model_name,
+                            model_name=output_model_name,
                             dataset=dataset,
                             result_file_name=result_file_base,
                             verbose=args.verbose,
@@ -330,7 +468,7 @@ def main():
                         model = infer_data_job_mt(
                             model,
                             work_dir=pred_root,
-                            model_name=model_name,
+                            model_name=output_model_name,
                             dataset=dataset,
                             verbose=args.verbose,
                             api_nproc=args.api_nproc,
@@ -340,7 +478,7 @@ def main():
                         model = infer_data_job(
                             model,
                             work_dir=pred_root,
-                            model_name=model_name,
+                            model_name=output_model_name,
                             dataset=dataset,
                             verbose=args.verbose,
                             api_nproc=args.api_nproc,
@@ -466,7 +604,7 @@ def main():
                     # Display Evaluation Results in Terminal
                     if eval_results is not None:
                         assert isinstance(eval_results, dict) or isinstance(eval_results, pd.DataFrame)
-                        logger.info(f'The evaluation of model {model_name} x dataset {dataset_name} has finished! ')
+                        logger.info(f'The evaluation of model {output_model_name} x dataset {dataset_name} has finished! ')
                         logger.info('Evaluation Results:')
                         if isinstance(eval_results, dict):
                             logger.info('\n' + json.dumps(eval_results, indent=4))
@@ -481,7 +619,7 @@ def main():
 
                     # Create the symbolic links for the prediction files
                     files = os.listdir(pred_root)
-                    files = [x for x in files if (f'{model_name}_{dataset_name}' in x or "status.json" in x)]
+                    files = [x for x in files if (f'{output_model_name}_{dataset_name}' in x or "status.json" in x)]
                     for f in files:
                         cwd = os.getcwd()
                         file_addr = osp.join(cwd, pred_root, f)
@@ -491,7 +629,7 @@ def main():
                         os.symlink(file_addr, link_addr)
 
             except Exception as e:
-                logger.exception(f'Model {model_name} x Dataset {dataset_name} combination failed: {e}, '
+                logger.exception(f'Model {output_model_name} x Dataset {dataset_name} combination failed: {e}, '
                                  'skipping this combination.')
                 continue
 
