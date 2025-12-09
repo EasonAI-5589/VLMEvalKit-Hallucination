@@ -80,7 +80,7 @@ class LLaVA(BaseModel):
 
     def use_custom_prompt(self, dataset):
         assert dataset is not None
-        if DATASET_TYPE(dataset) in ["MCQ", "Y/N"]:
+        if DATASET_TYPE(dataset) == "MCQ":
             return True
         return False
 
@@ -88,19 +88,6 @@ class LLaVA(BaseModel):
         assert self.use_custom_prompt(dataset)
         assert dataset is None or isinstance(dataset, str)
         tgt_path = self.dump_image(line, dataset)
-
-        # For Y/N type datasets (like MME), replace VLMEvalKit's "Please answer yes or no."
-        # with LLaVA's official "Answer the question using a single word or phrase." suffix
-        # Reference: https://github.com/haotian-liu/LLaVA/blob/main/docs/Evaluation.md (eval.zip)
-        if DATASET_TYPE(dataset) == "Y/N":
-            question = line["question"]
-            # Replace the default suffix with official LLaVA evaluation suffix
-            if question.endswith("Please answer yes or no."):
-                question = question.replace("Please answer yes or no.", "").strip()
-            prompt = question + "\nAnswer the question using a single word or phrase."
-            message = [dict(type="image", value=s) for s in tgt_path]
-            message.append(dict(type="text", value=prompt))
-            return message
 
         question = line["question"]
         hint = line["hint"] if ("hint" in line and not pd.isna(line["hint"])) else None
