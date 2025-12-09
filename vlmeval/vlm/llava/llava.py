@@ -62,7 +62,7 @@ class LLaVA(BaseModel):
             raise err
 
         self.model = self.model.cuda()
-        self.conv_mode = "llava_v1"
+        self.conv_mode = "vicuna_v1"
 
         kwargs_default = dict(
             do_sample=False,
