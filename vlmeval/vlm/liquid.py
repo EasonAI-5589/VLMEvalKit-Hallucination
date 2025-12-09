@@ -1,7 +1,11 @@
 from .base import BaseModel
 import torch
 from PIL import Image
-from transformers import AutoProcessor, AutoModelForImageTextToText
+from transformers import AutoProcessor
+try:
+    from transformers import AutoModelForImageTextToText
+except ImportError:
+    from transformers import AutoModelForVision2Seq as AutoModelForImageTextToText
 
 
 class LFM2VL(BaseModel):
